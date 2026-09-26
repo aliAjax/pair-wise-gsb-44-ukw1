@@ -5,6 +5,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -17,6 +18,10 @@ DEFAULT_DB = ROOT / "privacy_requests.db"
 REQUEST_TYPES = {"access", "correction", "deletion", "withdraw_consent", "restriction"}
 OPEN_STATUSES = {"received", "verifying", "processing", "extended", "response_ready"}
 FINAL_STATUSES = {"fulfilled", "rejected", "duplicate"}
+REDACTION_STATUSES = {"pending", "not_required", "redacted", "exempted"}
+PACKAGE_STATUSES = {"sealed", "released", "withdrawn", "superseded"}
+SEALABLE_REQUEST_STATUSES = {"processing", "extended", "response_ready"}
+FINGERPRINT_RE = re.compile(r"[0-9a-f]{64}")
 
 
 class DomainError(Exception):
@@ -53,6 +58,11 @@ def require_role(role: str, allowed: set[str], action: str) -> None:
 
 def sha256_text(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def manifest_hash(items: list[dict[str, Any]]) -> str:
+    canonical = json.dumps(items, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return sha256_text(canonical)
 
 
 class PrivacyRequestService:
@@ -125,10 +135,39 @@ class PrivacyRequestService:
                     third_party_exception INTEGER NOT NULL DEFAULT 0,
                     status TEXT NOT NULL DEFAULT 'located',
                     note TEXT NOT NULL DEFAULT '',
+                    redaction_status TEXT NOT NULL DEFAULT 'pending',
+                    content_fingerprint TEXT,
                     version INTEGER NOT NULL DEFAULT 1,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     UNIQUE(request_id,system_name,data_category)
+                );
+                CREATE TABLE IF NOT EXISTS delivery_packages (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    request_id INTEGER NOT NULL REFERENCES requests(id),
+                    version_no INTEGER NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'sealed',
+                    manifest_hash TEXT NOT NULL,
+                    item_count INTEGER NOT NULL,
+                    correction_reason TEXT,
+                    supersedes_id INTEGER REFERENCES delivery_packages(id),
+                    sealed_by TEXT NOT NULL,
+                    sealed_at TEXT NOT NULL,
+                    released_by TEXT,
+                    released_at TEXT,
+                    withdrawn_by TEXT,
+                    withdrawn_at TEXT,
+                    withdraw_reason TEXT,
+                    UNIQUE(request_id,version_no)
+                );
+                CREATE TABLE IF NOT EXISTS delivery_package_items (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    package_id INTEGER NOT NULL REFERENCES delivery_packages(id),
+                    location_id INTEGER NOT NULL REFERENCES data_locations(id),
+                    system_name TEXT NOT NULL,
+                    data_category TEXT NOT NULL,
+                    redaction_status TEXT NOT NULL,
+                    content_fingerprint TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS timeline (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -140,8 +179,18 @@ class PrivacyRequestService:
                 );
                 CREATE INDEX IF NOT EXISTS idx_requests_due ON requests(status,due_date);
                 CREATE INDEX IF NOT EXISTS idx_requests_subject ON requests(subject_id,request_type,submitted_at);
+                CREATE INDEX IF NOT EXISTS idx_packages_request ON delivery_packages(request_id,version_no);
+                CREATE INDEX IF NOT EXISTS idx_package_items ON delivery_package_items(package_id,location_id);
                 """
             )
+            self._migrate(conn)
+
+    def _migrate(self, conn: sqlite3.Connection) -> None:
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(data_locations)")}
+        if "redaction_status" not in columns:
+            conn.execute("ALTER TABLE data_locations ADD COLUMN redaction_status TEXT NOT NULL DEFAULT 'pending'")
+        if "content_fingerprint" not in columns:
+            conn.execute("ALTER TABLE data_locations ADD COLUMN content_fingerprint TEXT")
 
     def _audit(self, conn: sqlite3.Connection, request_id: int | None, actor: str,
                action: str, details: dict[str, Any]) -> None:
@@ -355,6 +404,49 @@ class PrivacyRequestService:
             self._audit(conn, row["request_id"], actor, "location.classified", {"location_id": location_id, "status": status})
             return dict(conn.execute("SELECT * FROM data_locations WHERE id=?", (location_id,)).fetchone())
 
+    def _apply_fingerprint(self, conn: sqlite3.Connection, req: sqlite3.Row, location_id: int,
+                           fingerprint: str, redaction_status: str, actor: str) -> dict[str, Any]:
+        row = conn.execute("SELECT * FROM data_locations WHERE id=? AND request_id=?", (location_id, req["id"])).fetchone()
+        if not row:
+            raise DomainError("数据位置不存在", 404)
+        if row["status"] != "classified":
+            raise DomainError("数据位置尚未完成分类，不能登记指纹", 409)
+        if row["contains_third_party"] and redaction_status == "not_required":
+            raise DomainError("含第三方数据的位置必须遮蔽或说明例外", 409)
+        if not row["contains_third_party"] and redaction_status == "exempted":
+            raise DomainError("不含第三方数据的位置不能使用例外状态", 409)
+        if redaction_status == "exempted" and not (row["third_party_exception"] or row["note"].strip()):
+            raise DomainError("使用例外状态需要第三方例外标记或说明", 409)
+        conn.execute(
+            "UPDATE data_locations SET content_fingerprint=?,redaction_status=?,version=version+1,updated_at=? WHERE id=?",
+            (fingerprint, redaction_status, utcnow(), location_id),
+        )
+        self._audit(conn, req["id"], actor, "location.fingerprint_recorded",
+                    {"location_id": location_id, "redaction_status": redaction_status, "fingerprint": fingerprint[:12]})
+        return dict(conn.execute("SELECT * FROM data_locations WHERE id=?", (location_id,)).fetchone())
+
+    def record_fingerprint(self, actor: str, role: str, location_id: int,
+                           content_fingerprint: str, redaction_status: str) -> dict[str, Any]:
+        actor = clean_actor(actor)
+        require_role(role, {"privacy_officer", "supervisor"}, "登记内容指纹")
+        fingerprint = (content_fingerprint or "").strip().lower()
+        if not FINGERPRINT_RE.fullmatch(fingerprint):
+            raise DomainError("内容指纹必须是64位十六进制SHA-256")
+        if redaction_status not in REDACTION_STATUSES - {"pending"}:
+            raise DomainError("遮蔽状态无效")
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT * FROM data_locations WHERE id=?", (location_id,)).fetchone()
+            if not row:
+                raise DomainError("数据位置不存在", 404)
+            req = self._request(conn, row["request_id"])
+            self._can_process(actor, role, req, "登记内容指纹")
+            if req["status"] not in {"processing", "extended"}:
+                raise DomainError("请求当前不能登记内容指纹", 409)
+            if self._sealed_package(conn, req["id"]):
+                raise DomainError("交付包已封存，请先撤回或补正", 409)
+            return self._apply_fingerprint(conn, req, row["id"], fingerprint, redaction_status, actor)
+
     def extend_request(self, actor: str, role: str, request_id: int, days: int,
                        reason: str, expected_version: int) -> dict[str, Any]:
         actor = clean_actor(actor)
@@ -454,6 +546,245 @@ class PrivacyRequestService:
             self._audit(conn, request_id, actor, "request.rejected", {"reason": reason.strip()})
             return dict(self._request(conn, request_id))
 
+    def _sealed_package(self, conn: sqlite3.Connection, request_id: int) -> sqlite3.Row | None:
+        return conn.execute(
+            "SELECT * FROM delivery_packages WHERE request_id=? AND status='sealed' ORDER BY version_no DESC LIMIT 1",
+            (request_id,),
+        ).fetchone()
+
+    def _package_dict(self, conn: sqlite3.Connection, pkg: sqlite3.Row) -> dict[str, Any]:
+        data = dict(pkg)
+        data["items"] = [dict(r) for r in conn.execute(
+            "SELECT * FROM delivery_package_items WHERE package_id=? ORDER BY location_id", (pkg["id"],)).fetchall()]
+        return data
+
+    def _location_ready(self, row: sqlite3.Row) -> bool:
+        return (row["status"] == "classified" and not row["legal_hold"]
+                and row["redaction_status"] in {"not_required", "redacted", "exempted"}
+                and (not row["contains_third_party"] or row["redaction_status"] in {"redacted", "exempted"})
+                and bool(row["content_fingerprint"]))
+
+    def _sealable_locations(self, conn: sqlite3.Connection, request_id: int) -> tuple[list[sqlite3.Row], list[str]]:
+        locations = conn.execute("SELECT * FROM data_locations WHERE request_id=? ORDER BY id", (request_id,)).fetchall()
+        problems: list[str] = []
+        if not locations:
+            problems.append("尚未登记任何数据位置")
+        for row in locations:
+            label = "%s/%s" % (row["system_name"], row["data_category"])
+            if row["status"] in {"located", "needs_redaction"}:
+                problems.append("%s：未分类或未完成去标识" % label)
+                continue
+            if row["legal_hold"]:
+                problems.append("%s：仍存在法律保留" % label)
+            if row["redaction_status"] == "pending":
+                problems.append("%s：遮蔽状态未登记" % label)
+            elif row["contains_third_party"] and row["redaction_status"] not in {"redacted", "exempted"}:
+                problems.append("%s：第三方遮蔽未完成" % label)
+            if not row["content_fingerprint"]:
+                problems.append("%s：缺少内容指纹" % label)
+        return locations, problems
+
+    def _create_package(self, conn: sqlite3.Connection, req: sqlite3.Row, actor: str,
+                        locations: list[sqlite3.Row], correction_reason: str | None = None,
+                        supersedes_id: int | None = None) -> dict[str, Any]:
+        items = [
+            {"location_id": row["id"], "system_name": row["system_name"], "data_category": row["data_category"],
+             "redaction_status": row["redaction_status"], "content_fingerprint": row["content_fingerprint"]}
+            for row in locations
+        ]
+        manifest = manifest_hash(items)
+        version_no = conn.execute(
+            "SELECT COALESCE(MAX(version_no),0) AS v FROM delivery_packages WHERE request_id=?", (req["id"],)).fetchone()["v"] + 1
+        now = utcnow()
+        cur = conn.execute(
+            """INSERT INTO delivery_packages(request_id,version_no,status,manifest_hash,item_count,correction_reason,supersedes_id,sealed_by,sealed_at)
+               VALUES(?,?,?,?,?,?,?,?,?)""",
+            (req["id"], version_no, "sealed", manifest, len(items), correction_reason, supersedes_id, actor, now),
+        )
+        package_id = cur.lastrowid
+        for item in items:
+            conn.execute(
+                """INSERT INTO delivery_package_items(package_id,location_id,system_name,data_category,redaction_status,content_fingerprint)
+                   VALUES(?,?,?,?,?,?)""",
+                (package_id, item["location_id"], item["system_name"], item["data_category"],
+                 item["redaction_status"], item["content_fingerprint"]),
+            )
+        pkg = conn.execute("SELECT * FROM delivery_packages WHERE id=?", (package_id,)).fetchone()
+        return self._package_dict(conn, pkg)
+
+    def seal_package(self, actor: str, role: str, request_id: int,
+                     expected_version: int) -> dict[str, Any]:
+        actor = clean_actor(actor)
+        require_role(role, {"privacy_officer", "supervisor"}, "封存交付包")
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            req = self._request(conn, request_id)
+            self._can_process(actor, role, req, "封存交付包")
+            if req["request_type"] != "access":
+                raise DomainError("只有查阅请求需要交付包", 409)
+            if req["status"] not in SEALABLE_REQUEST_STATUSES:
+                raise DomainError("当前请求不能封存交付包", 409)
+            if req["version"] != int(expected_version):
+                raise DomainError("请求已变化，请刷新后重试", 409)
+            if self._sealed_package(conn, request_id):
+                raise DomainError("存在未发出的交付包，请先发出或撤回", 409)
+            locations, problems = self._sealable_locations(conn, request_id)
+            if problems:
+                raise DomainError("不能封包：" + "；".join(problems), 409)
+            package = self._create_package(conn, req, actor, locations)
+            conn.execute("UPDATE requests SET version=version+1,updated_at=? WHERE id=? AND version=?",
+                         (utcnow(), request_id, expected_version))
+            self._audit(conn, request_id, actor, "package.sealed",
+                        {"package_id": package["id"], "version_no": package["version_no"],
+                         "item_count": package["item_count"], "manifest_hash": package["manifest_hash"]})
+            return package
+
+    def _latest_package(self, conn: sqlite3.Connection, request_id: int) -> sqlite3.Row | None:
+        return conn.execute(
+            "SELECT * FROM delivery_packages WHERE request_id=? ORDER BY version_no DESC LIMIT 1", (request_id,)).fetchone()
+
+    def release_package(self, actor: str, role: str, package_id: int) -> dict[str, Any]:
+        actor = clean_actor(actor)
+        require_role(role, {"privacy_officer", "supervisor"}, "发出交付包")
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            pkg = conn.execute("SELECT * FROM delivery_packages WHERE id=?", (package_id,)).fetchone()
+            if not pkg:
+                raise DomainError("交付包不存在", 404)
+            req = self._request(conn, pkg["request_id"])
+            self._can_process(actor, role, req, "发出交付包")
+            if pkg["status"] != "sealed":
+                raise DomainError("只有已封存未发出的交付包可以发出", 409)
+            now = utcnow()
+            conn.execute("UPDATE delivery_packages SET status='released',released_by=?,released_at=? WHERE id=? AND status='sealed'",
+                         (actor, now, package_id))
+            self._audit(conn, pkg["request_id"], actor, "package.released",
+                        {"package_id": package_id, "version_no": pkg["version_no"], "manifest_hash": pkg["manifest_hash"]})
+            return self._package_dict(conn, conn.execute("SELECT * FROM delivery_packages WHERE id=?", (package_id,)).fetchone())
+
+    def withdraw_package(self, actor: str, role: str, package_id: int, reason: str) -> dict[str, Any]:
+        actor = clean_actor(actor)
+        require_role(role, {"privacy_officer", "supervisor"}, "撤回交付包")
+        if not (reason or "").strip():
+            raise DomainError("撤回原因不能为空")
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            pkg = conn.execute("SELECT * FROM delivery_packages WHERE id=?", (package_id,)).fetchone()
+            if not pkg:
+                raise DomainError("交付包不存在", 404)
+            req = self._request(conn, pkg["request_id"])
+            self._can_process(actor, role, req, "撤回交付包")
+            if pkg["status"] != "sealed":
+                raise DomainError("只有未发出的交付包可以撤回", 409)
+            now = utcnow()
+            conn.execute(
+                "UPDATE delivery_packages SET status='withdrawn',withdrawn_by=?,withdrawn_at=?,withdraw_reason=? WHERE id=? AND status='sealed'",
+                (actor, now, reason.strip(), package_id))
+            released_locations = [r["location_id"] for r in conn.execute(
+                "SELECT location_id FROM delivery_package_items WHERE package_id=? ORDER BY location_id", (package_id,)).fetchall()]
+            self._audit(conn, pkg["request_id"], actor, "package.withdrawn",
+                        {"package_id": package_id, "version_no": pkg["version_no"],
+                         "reason": reason.strip(), "released_locations": released_locations})
+            return self._package_dict(conn, conn.execute("SELECT * FROM delivery_packages WHERE id=?", (package_id,)).fetchone())
+
+    def correct_package(self, actor: str, role: str, package_id: int, reason: str,
+                        items: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+        actor = clean_actor(actor)
+        require_role(role, {"privacy_officer", "supervisor"}, "补正交付包")
+        if not (reason or "").strip():
+            raise DomainError("补正原因不能为空")
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            pkg = conn.execute("SELECT * FROM delivery_packages WHERE id=?", (package_id,)).fetchone()
+            if not pkg:
+                raise DomainError("交付包不存在", 404)
+            req = self._request(conn, pkg["request_id"])
+            self._can_process(actor, role, req, "补正交付包")
+            latest = self._latest_package(conn, pkg["request_id"])
+            if not latest or latest["id"] != pkg["id"] or pkg["status"] not in {"sealed", "released"}:
+                raise DomainError("只能补正当前最新的已封存或已发出交付包", 409)
+            if req["status"] not in SEALABLE_REQUEST_STATUSES:
+                raise DomainError("案件已办结，请先重开再补正交付包", 409)
+            for item in items or []:
+                try:
+                    location_id = int(item["location_id"])
+                    fingerprint = str(item["content_fingerprint"]).strip().lower()
+                    redaction_status = str(item["redaction_status"]).strip()
+                except (KeyError, TypeError, ValueError) as exc:
+                    raise DomainError("补正条目参数无效") from exc
+                if not FINGERPRINT_RE.fullmatch(fingerprint):
+                    raise DomainError("内容指纹必须是64位十六进制SHA-256")
+                if redaction_status not in REDACTION_STATUSES - {"pending"}:
+                    raise DomainError("遮蔽状态无效")
+                self._apply_fingerprint(conn, req, location_id, fingerprint, redaction_status, actor)
+            locations, problems = self._sealable_locations(conn, pkg["request_id"])
+            if problems:
+                raise DomainError("不能封包：" + "；".join(problems), 409)
+            conn.execute("UPDATE delivery_packages SET status='superseded' WHERE id=?", (package_id,))
+            package = self._create_package(conn, req, actor, locations,
+                                           correction_reason=reason.strip(), supersedes_id=pkg["id"])
+            self._audit(conn, pkg["request_id"], actor, "package.corrected",
+                        {"superseded_package_id": package_id, "package_id": package["id"],
+                         "from_version": pkg["version_no"], "to_version": package["version_no"],
+                         "reason": reason.strip(), "manifest_hash": package["manifest_hash"]})
+            return package
+
+    def reopen_request(self, actor: str, role: str, request_id: int, reason: str,
+                       expected_version: int) -> dict[str, Any]:
+        actor = clean_actor(actor)
+        require_role(role, {"privacy_officer", "supervisor"}, "重开案件")
+        if not reason.strip():
+            raise DomainError("重开原因不能为空")
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            req = self._request(conn, request_id)
+            self._can_process(actor, role, req, "重开案件")
+            if req["status"] != "fulfilled":
+                raise DomainError("只有已办结的请求可以重开", 409)
+            if req["version"] != int(expected_version):
+                raise DomainError("请求已变化，请刷新后重试", 409)
+            conn.execute("UPDATE requests SET status='processing',version=version+1,updated_at=? WHERE id=? AND version=?",
+                         (utcnow(), request_id, expected_version))
+            self._audit(conn, request_id, actor, "request.reopened", {"reason": reason.strip()})
+            return dict(self._request(conn, request_id))
+
+    def list_packages(self, actor: str, role: str, request_id: int) -> dict[str, Any]:
+        actor = clean_actor(actor)
+        with self.connect() as conn:
+            req = self._request(conn, request_id)
+            if role in {"supervisor", "auditor"}:
+                pass
+            elif role == "privacy_officer" and req["assigned_to"] == actor:
+                pass
+            elif role == "intake" and req["created_by"] == actor:
+                pass
+            else:
+                raise DomainError("无权查看该权利请求", 403)
+            packages = [self._package_dict(conn, row) for row in conn.execute(
+                "SELECT * FROM delivery_packages WHERE request_id=? ORDER BY version_no", (request_id,)).fetchall()]
+            locations, problems = self._sealable_locations(conn, request_id)
+            blocking = list(problems)
+            if req["request_type"] != "access":
+                blocking.append("非查阅请求不需要交付包")
+            if req["status"] not in SEALABLE_REQUEST_STATUSES:
+                blocking.append("请求状态为 %s，不能封包" % req["status"])
+            sealed = self._sealed_package(conn, request_id)
+            if sealed:
+                blocking.append("版本 %d 已封存未发出" % sealed["version_no"])
+            latest = packages[-1] if packages else None
+            pending_correction = latest if latest and latest["status"] in {"superseded", "withdrawn"} else None
+            return {
+                "request_id": request_id,
+                "packages": packages,
+                "sealable": {
+                    "ready": not blocking,
+                    "blocking": blocking,
+                    "locations": [dict(dict(row), ready=self._location_ready(row)) for row in locations],
+                },
+                "pending_correction": pending_correction,
+                "released_versions": [pkg for pkg in packages if pkg["released_at"]],
+            }
+
     def _visibility(self, actor: str, role: str, conn: sqlite3.Connection) -> list[sqlite3.Row]:
         if role in {"supervisor", "auditor"}:
             return conn.execute("SELECT * FROM requests ORDER BY due_date,id").fetchall()
@@ -477,7 +808,9 @@ class PrivacyRequestService:
                 raise DomainError("无权查看该权利请求", 403)
             locations = [dict(r) for r in conn.execute("SELECT * FROM data_locations WHERE request_id=? ORDER BY id", (request_id,)).fetchall()]
             timeline = [dict(r) for r in conn.execute("SELECT * FROM timeline WHERE request_id=? ORDER BY id", (request_id,)).fetchall()]
-            return {"request": dict(req), "locations": locations, "timeline": timeline}
+            packages = [self._package_dict(conn, row) for row in conn.execute(
+                "SELECT * FROM delivery_packages WHERE request_id=? ORDER BY version_no", (request_id,)).fetchall()]
+            return {"request": dict(req), "locations": locations, "timeline": timeline, "packages": packages}
 
     def queue(self, actor: str, role: str) -> list[dict[str, Any]]:
         with self.connect() as conn:
@@ -495,14 +828,16 @@ class PrivacyRequestService:
             rows = self._visibility(actor, role, conn)
             requests = []
             locations = []
+            packages = []
             for row in rows:
                 item = dict(row)
                 item["overdue"] = parse_time(item["due_date"]) < datetime.now(timezone.utc) and item["status"] in OPEN_STATUSES
                 requests.append(item)
                 locations.extend(dict(r) for r in conn.execute("SELECT * FROM data_locations WHERE request_id=? ORDER BY id", (row["id"],)).fetchall())
+                packages.extend(dict(r) for r in conn.execute("SELECT * FROM delivery_packages WHERE request_id=? ORDER BY version_no", (row["id"],)).fetchall())
             timeline = [dict(r) for r in conn.execute("SELECT * FROM timeline ORDER BY id DESC LIMIT 300").fetchall()]
             jurisdictions = [dict(r) for r in conn.execute("SELECT * FROM jurisdictions ORDER BY code").fetchall()]
-        return {"requests": requests, "locations": locations, "timeline": timeline, "jurisdictions": jurisdictions, "access_limited": not bool(requests)}
+        return {"requests": requests, "locations": locations, "packages": packages, "timeline": timeline, "jurisdictions": jurisdictions, "access_limited": not bool(requests)}
 
     def seed_demo(self) -> dict[str, Any]:
         with self.connect() as conn:
@@ -561,7 +896,11 @@ class ApiHandler(BaseHTTPRequestHandler):
             elif path == "/api/queue":
                 self._send(200, {"queue": self.service.queue(actor, role)})
             elif path.startswith("/api/requests/"):
-                self._send(200, self.service.get_request(actor, role, int(path.split("/")[3])))
+                parts = path.split("/")
+                if len(parts) == 5 and parts[4] == "packages":
+                    self._send(200, self.service.list_packages(actor, role, int(parts[3])))
+                else:
+                    self._send(200, self.service.get_request(actor, role, int(parts[3])))
             else:
                 self._send(404, {"error": "接口不存在"})
         except DomainError as exc:
@@ -586,6 +925,18 @@ class ApiHandler(BaseHTTPRequestHandler):
                 result = self.service.add_data_location(actor, role, **data)
             elif path == "/api/locations/classify":
                 result = self.service.classify_location(actor, role, **data)
+            elif path == "/api/locations/fingerprint":
+                result = self.service.record_fingerprint(actor, role, **data)
+            elif path == "/api/packages/seal":
+                result = self.service.seal_package(actor, role, **data)
+            elif path == "/api/packages/release":
+                result = self.service.release_package(actor, role, **data)
+            elif path == "/api/packages/withdraw":
+                result = self.service.withdraw_package(actor, role, **data)
+            elif path == "/api/packages/correct":
+                result = self.service.correct_package(actor, role, **data)
+            elif path == "/api/requests/reopen":
+                result = self.service.reopen_request(actor, role, **data)
             elif path == "/api/requests/extend":
                 result = self.service.extend_request(actor, role, **data)
             elif path == "/api/requests/prepare":
